@@ -1,0 +1,88 @@
+#!/usr/bin/env php
+<?php
+
+use App\Kernel;
+use App\Service\QueueServiceInterface;
+use PhpAmqpLib\Message\AMQPMessage;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\Store\SemaphoreStore;
+
+require_once dirname(__DIR__).'/vendor/autoload_runtime.php';
+
+return function (array $context) {
+    $kernel = new Kernel($context['APP_ENV'], (bool) $context['APP_DEBUG']);
+    $kernel->boot();
+
+    $container = $kernel->getContainer();
+
+    $queue = $container->getParameter('amqp.queue.name');
+    $exchange = $container->getParameter('amqp.exchange.name');
+    $consumer = $container->getParameter('amqp.consumer.name');
+
+    /**
+     * @var QueueServiceInterface $queueService
+     */
+    $queueService = $container->get('queue.service');
+
+    register_shutdown_function(
+        static function () use ($queueService) {
+            $queueService->close();
+        }
+    );
+
+    $queueService->consume(
+        $exchange,
+        $queue,
+        $consumer,
+        static function (AMQPMessage $message) use ($queueService) {
+            $data = unserialize($message->body);
+
+            $lockKey = 'account_event_' . $data['accountId'];
+
+            $factory = new LockFactory(
+                new SemaphoreStore()
+            );
+
+            /**
+             * Поставим ttl в 5 сек.
+             */
+            $lock = $factory->createLock($lockKey, 5);
+
+            try {
+                if (!$lock->acquire()) {
+                    /**
+                     * Если другой процесс уже обрабатывает сообщение с таким accountId,
+                     * подождем немного, и снова отправим сообщение назад в очередь.
+                     * AMQP гарантирует сохранение его места в очереди.
+                     *
+                     * Если тут "не спать", то сообщение мгновенно вернется из очереди.
+                     * За 1 сек. таких возвратов может быть много, очень много.
+                     *
+                     * Из минусов, похоже данный процесс "зависнет" пока ждем.
+                     * Возможно, это решается установкой опции "nowait" в true для consumer.
+                     * Либо придется снижать время "сна".
+                     *
+                     * В любом случае, это не должно стать проблемой, потому что параллельно будет запущено много consumer'ов.
+                     * Например, через supervisor можем легко регулировать их количество.
+                     */
+                    usleep(100_000);
+
+                    $message->nack(true);
+                    return;
+                }
+
+                // handle message
+
+                sleep(1);
+
+                $message->ack();
+            } catch (\Throwable $e) {
+                // requeue message to another queue
+            } finally {
+                $lock->release();
+            }
+        }
+    );
+};
+
+
